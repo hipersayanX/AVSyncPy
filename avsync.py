@@ -34,32 +34,46 @@ AV_SYNC_THRESHOLD_MAX = 0.1
 
 class Decoder:
     def __init__(self):
-        # Initialize AV frames.
-        self.aPts = 0
-        self.aDuration = 0.01
+        self.aPacket = {'mimeType': 'audio/x-raw',
+                        'channels': 6,
+                        'rate': 48000,
+                        'samples': 512}
 
-        self.vPts = 0
-        self.vDuration = 0.041
+        self.vPacket = {'mimeType': 'video/x-raw',
+                        'fps': 13978 / 583}
+
+        # Initialize AV frames.
+        self.aN = 0
+        self.aDuration = self.aPacket['samples'] / self.aPacket['rate']
+
+        self.vN = 0
+        self.vDuration = 1 / self.vPacket['fps']
 
     # Simulate frame capturing.
     def getFrame(self):
+        aPts = self.aN * self.aDuration
+        vPts = self.vN * self.vDuration
+
         # Get an audio frame.
-        if self.aPts <= self.vPts:
-            pts = self.aPts
-            self.aPts += self.aDuration
+        if aPts <= vPts:
+            packet = {'pts': aPts, 'duration': self.aDuration}
+            packet.update(self.aPacket)
+            self.aN += 1
 
-            return ['a', pts, self.aDuration]
+            return packet
         # Get an video frame.
-        elif self.aPts > self.vPts:
-            pts = self.vPts
-            self.vPts += self.vDuration
+        else:
+            packet = {'pts': vPts, 'duration': self.vDuration}
+            packet.update(self.vPacket)
+            self.vN += 1
 
-            return ['v', pts, self.vDuration]
+            return packet
 
 class Output:
     # Simulate frame processing.
-    def releaseFrame(self, frame=['a', 0, 0]):
-        time.sleep(frame[2])
+    def releaseFrame(self, frame={}):
+        jitter = 0.0 #random.uniform(0.0, 0.02)
+        time.sleep(frame['duration'] + jitter)
 
 class Clock:
     def __init__(self, slave=False):
@@ -71,7 +85,7 @@ class Clock:
     def clock(self, pts=0):
         clock = time.time()
 
-        if not self.clock0:
+        if self.clock0 == None:
             self.clock0 = pts if self.slave else clock
 
         if not self.slave:
@@ -87,40 +101,52 @@ class Clock:
 
 if __name__== "__main__":
     decoder = Decoder()
-    audioClock = Clock(True)
-    videoClock = Clock(True)
-    extrnClock = Clock()
+    output = Output()
+    fst = True
 
     while True:
         frame = decoder.getFrame()
 
+        if fst:
+            audioClock = Clock(True)
+            videoClock = Clock(True)
+            extrnClock = Clock()
+            fst = False
+
         clock = extrnClock.clock()
-        streamType = frame[0]
+        streamType = frame['mimeType']
 
-        if streamType == 'a':
-            pts = audioClock.clock(frame[1])
+        if streamType == 'audio/x-raw':
+            pts = audioClock.clock(frame['pts'])
         else:
-            pts = videoClock.clock(frame[1])
+            pts = videoClock.clock(frame['pts'])
 
-        diff = clock - pts
-
-        print(streamType, '{0:.2f}'.format(clock), '{0:.2f}'.format(pts), '{0:.2f}'.format(diff))
+        diff = pts - clock
+        show = False
 
         if abs(diff) < AV_SYNC_THRESHOLD_MIN:
-            Output.releaseFrame(frame)
+            show = True
+            output.releaseFrame(frame)
         elif abs(diff) < AV_SYNC_THRESHOLD_MAX:
             if diff < 0:
-                # Add a delay
-                time.sleep(abs(diff))
-                Output.releaseFrame(frame)
-            else:
                 # Discard frame
                 pass
+            else:
+                # Add a delay
+                if streamType == 'audio/x-raw':
+                    pass
+                else:
+                    show = True
+                    time.sleep(abs(diff))
+                    output.releaseFrame(frame)
         else:
+            show = True
             # Resync to the master clock
-            if streamType == 'a':
+            if streamType == 'audio/x-raw':
                 audioClock.syncTo(clock)
             else:
                 videoClock.syncTo(clock)
 
-#            Output.releaseFrame()
+            output.releaseFrame(frame)
+
+        print(streamType[0], '{0:.2f}'.format(clock), '{0:.2f}'.format(pts), '{0:.2f}'.format(diff), show)
