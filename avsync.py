@@ -22,6 +22,7 @@
 
 import time
 import random
+import threading
 
 # Timming in seconds
 
@@ -98,55 +99,128 @@ class Clock:
     def syncTo(self, pts=0):
         self.drift += pts - self.lastClock
 
+class Lock:
+    def __init__(self, nLocks=1):
+        self.lock = threading.Lock()
+        self.counterLock = threading.Lock()
+        self.nLocked = 0
+        self.nLocks = nLocks
 
-if __name__== "__main__":
-    decoder = Decoder()
-    output = Output()
-    fst = True
+    def acquire(self):
+        self.counterLock.acquire()
+        self.nLocked += 1
 
-    while True:
-        frame = decoder.getFrame()
+        if self.nLocked == self.nLocks:
+            self.lock.acquire()
 
-        if fst:
-            audioClock = Clock(True)
-            videoClock = Clock(True)
-            extrnClock = Clock()
-            fst = False
+        self.counterLock.release()
 
-        clock = extrnClock.clock()
-        streamType = frame['mimeType']
+    def release(self):
+        self.counterLock.acquire()
 
-        if streamType == 'audio/x-raw':
-            pts = audioClock.clock(frame['pts'])
-        else:
-            pts = videoClock.clock(frame['pts'])
+        if self.nLocked == self.nLocks:
+            self.lock.release()
 
-        diff = pts - clock
+        self.nLocked -= 1
+        self.counterLock.release()
+
+    def wait(self):
+        self.lock.acquire()
+        self.lock.release()
+
+class Sync:
+    def __init__(self):
+        self.output = Output()
+        self.init()
+
+    def init(self):
+        self.audioClock = Clock(True)
+        self.videoClock = Clock(True)
+        self.extrnClock = Clock()
+
+        self.audioLock = threading.Lock()
+        self.videoLock = threading.Lock()
+        self.globalLock = Lock(2)
+
+    def processAudioFrame(self, packet={}):
+        self.audioLock.acquire()
+        self.globalLock.acquire()
+
+        clock = self.extrnClock.clock()
+        pts = self.videoClock.clock(packet['pts'])
+        diff = clock - pts
+        show = True
+
+        self.output.releaseFrame(packet)
+
+        print(packet['mimeType'][0],
+              '{0:.2f}'.format(clock),
+              '{0:.2f}'.format(pts),
+              '{0:.2f}'.format(diff),
+              show)
+
+        self.globalLock.release()
+        self.audioLock.release()
+
+    def processVideoFrame(self, packet={}):
+        self.videoLock.acquire()
+        self.globalLock.acquire()
+
+        clock = self.extrnClock.clock()
+        pts = self.videoClock.clock(packet['pts'])
+        diff = clock - pts
         show = False
 
         if abs(diff) < AV_SYNC_THRESHOLD_MIN:
             show = True
-            output.releaseFrame(frame)
+            self.output.releaseFrame(packet)
         elif abs(diff) < AV_SYNC_THRESHOLD_MAX:
             if diff < 0:
+                # Add a delay
+                show = True
+                time.sleep(abs(diff))
+                self.output.releaseFrame(packet)
+            else:
                 # Discard frame
                 pass
-            else:
-                # Add a delay
-                if streamType == 'audio/x-raw':
-                    pass
-                else:
-                    show = True
-                    time.sleep(abs(diff))
-                    output.releaseFrame(frame)
         else:
-            show = True
             # Resync to the master clock
-            if streamType == 'audio/x-raw':
-                audioClock.syncTo(clock)
-            else:
-                videoClock.syncTo(clock)
+            show = True
+            self.videoClock.syncTo(clock)
+            self.output.releaseFrame(packet)
 
-            output.releaseFrame(frame)
+        print(packet['mimeType'][0],
+              '{0:.2f}'.format(clock),
+              '{0:.2f}'.format(pts),
+              '{0:.2f}'.format(diff),
+              show)
 
-        print(streamType[0], '{0:.2f}'.format(clock), '{0:.2f}'.format(pts), '{0:.2f}'.format(diff), show)
+        self.globalLock.release()
+        self.videoLock.release()
+
+    def shrinkAudio(self, pts=0, clock=0, frame={}):
+        pass
+
+    def growAudio(self, pts=0, clock=0, frame={}):
+        pass
+
+
+if __name__== "__main__":
+    decoder = Decoder()
+    sync = Sync()
+    fst = True
+
+    while True:
+        frame = decoder.getFrame()
+        sync.globalLock.wait()
+
+        if fst:
+            sync.init()
+            fst = False
+
+        streamType = frame['mimeType']
+
+        if streamType == 'audio/x-raw':
+            threading.Thread(target=sync.processAudioFrame, args=(frame, )).start()
+        else:
+            threading.Thread(target=sync.processVideoFrame, args=(frame, )).start()
