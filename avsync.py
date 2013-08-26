@@ -32,10 +32,17 @@ AV_SYNC_THRESHOLD_MIN = 0.01
 # AV sync correction is done if above the maximum AV sync threshold.
 AV_SYNC_THRESHOLD_MAX = 0.1
 
+# maximum audio speed change to get correct sync
+SAMPLE_CORRECTION_PERCENT_MAX = 0.1
+
+# we use about AUDIO_DIFF_AVG_NB A-V differences to make the average
+AUDIO_DIFF_AVG_NB = 20
+
 
 class Decoder:
     def __init__(self):
         self.aPacket = {'mimeType': 'audio/x-raw',
+                        'bps': 4,
                         'channels': 6,
                         'rate': 48000,
                         'samples': 512}
@@ -51,7 +58,7 @@ class Decoder:
         self.vDuration = 1 / self.vPacket['fps']
 
     # Simulate frame capturing.
-    def getFrame(self):
+    def getPacket(self):
         aPts = self.aN * self.aDuration
         vPts = self.vN * self.vDuration
 
@@ -147,11 +154,36 @@ class Sync:
         self.globalLock.acquire()
 
         clock = self.extrnClock.clock()
-        pts = self.videoClock.clock(packet['pts'])
+        pts = self.audioClock.clock(packet['pts'])
         diff = clock - pts
-        show = True
+        show = False
+        duration = packet['samples'] / packet['rate']
+        minThreshhold = duration * (1 - SAMPLE_CORRECTION_PERCENT_MAX)
+        maxThreshhold = duration * (1 + SAMPLE_CORRECTION_PERCENT_MAX)
 
-        self.output.releaseFrame(packet)
+        if abs(diff) < minThreshhold:
+            show = True
+            self.output.releaseFrame(packet)
+        elif abs(diff) < maxThreshhold:
+            if diff < 0:
+                # Add a delay
+                show = True
+                newPacket = self.growAudio(packet, abs(diff))
+
+                if newPacket != {}:
+                    self.output.releaseFrame(newPacket)
+            else:
+                # Discard frame
+                show = True
+                newPacket = self.shrinkAudio(packet, diff)
+
+                if newPacket != {}:
+                    self.output.releaseFrame(newPacket)
+        else:
+            # Resync to the master clock
+            show = True
+            self.audioClock.syncTo(clock)
+            self.output.releaseFrame(packet)
 
         print(packet['mimeType'][0],
               '{0:.2f}'.format(clock),
@@ -198,11 +230,36 @@ class Sync:
         self.globalLock.release()
         self.videoLock.release()
 
-    def shrinkAudio(self, pts=0, clock=0, frame={}):
-        pass
+    def growAudio(self, packet={}, diff=0):
+        samplesDiff = round(diff * packet['rate'])
+        bytesDiff = samplesDiff * packet['bps'] * packet['channels']
 
-    def growAudio(self, pts=0, clock=0, frame={}):
-        pass
+        print('grow', samplesDiff, bytesDiff)
+
+        if samplesDiff > 0:
+            return packet
+
+        return packet
+
+    def shrinkAudio(self, packet={}, diff=0):
+        samplesDiff = round(diff * packet['rate'])
+        samplesDiff = max(0, min(samplesDiff, packet['samples']))
+
+        # You must remove bytesDiff
+        bytesDiff = samplesDiff * packet['bps'] * packet['channels']
+
+        if samplesDiff < packet['samples']:
+            newPacket = packet
+            samples = packet['samples'] - samplesDiff
+            duration = samples / packet['rate']
+            pts = packet['pts'] + packet['duration'] - duration
+            newPacket['samples'] = samples
+            newPacket['duration'] = duration
+            newPacket['pts'] = pts
+
+            return newPacket
+
+        return {}
 
 
 if __name__== "__main__":
@@ -211,16 +268,18 @@ if __name__== "__main__":
     fst = True
 
     while True:
-        frame = decoder.getFrame()
+        packet = decoder.getPacket()
         sync.globalLock.wait()
 
         if fst:
             sync.init()
             fst = False
 
-        streamType = frame['mimeType']
+        streamType = packet['mimeType']
 
         if streamType == 'audio/x-raw':
-            threading.Thread(target=sync.processAudioFrame, args=(frame, )).start()
+            threading.Thread(target=sync.processAudioFrame,
+                             args=(packet, )).start()
         else:
-            threading.Thread(target=sync.processVideoFrame, args=(frame, )).start()
+            threading.Thread(target=sync.processVideoFrame,
+                             args=(packet, )).start()
