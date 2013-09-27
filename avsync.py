@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 #
-# AVSyncPy, webcam capture plasmoid.
-# Copyright (C) 2011-2013  Gonzalo Exequiel Pedone
+# AVSyncPy, Lip synchronization algorith implemented in Python.
+# Copyright (C) 2013  Gonzalo Exequiel Pedone
 #
 # AVSyncPy is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -37,15 +37,16 @@ AV_SYNC_THRESHOLD_MAX = 0.1
 # no AV correction is done if too big error.
 AV_NOSYNC_THRESHOLD = 5.0
 
-# maximum audio speed change to get correct sync
+# maximum audio speed change to get correct sync.
 SAMPLE_CORRECTION_PERCENT_MAX = 0.1
+
+# we use about AUDIO_DIFF_AVG_NB A-V differences to make the average.
+AUDIO_DIFF_AVG_NB = 20
 
 
 class Decoder:
     def __init__(self):
         self.aPacket = {'mimeType': 'audio/x-raw',
-                        'bps': 4,
-                        'channels': 6,
                         'rate': 48000,
                         'samples': 512}
 
@@ -60,7 +61,7 @@ class Decoder:
         self.vDuration = 1 / self.vPacket['fps']
 
     # Simulate frame capturing.
-    def getPacket(self):
+    def readPacket(self):
         aPts = self.aN * self.aDuration
         vPts = self.vN * self.vDuration
 
@@ -192,6 +193,11 @@ class Sync:
         self.log = True
         self.plainLog = False
 
+        self.audioDiffAvgCoef = math.exp(math.log(0.01) / AUDIO_DIFF_AVG_NB)
+        self.audioDiffCum = 0
+        self.audioDiffAvgCount = 0
+        self.setOutputAudioBufferSize(512)
+
         self.avqueue = AVQueue()
         self.output = Output()
 
@@ -220,51 +226,53 @@ class Sync:
     def iStream(self, packet={}):
         self.avqueue.enqueue(packet)
 
-    def synchronizeAudio(self, diff=0.0, delay=0.0):
-        # syncThreshold = 2 * delay
-        #
-        # (resync)
-        # -syncThreshold
-        # (discard)
-        # [-delay * SAMPLE_CORRECTION_PERCENT_MAX]
-        # (release)
-        # [delay * SAMPLE_CORRECTION_PERCENT_MAX]
-        # (wait)
-        # syncThreshold
-        # (resync)
+    def setOutputAudioBufferSize(self, outputAudioBufferSize=512):
+        self.outputAudioBufferSize = outputAudioBufferSize
 
-        syncThreshold = 2 * delay
-        correctionThreshold = delay * SAMPLE_CORRECTION_PERCENT_MAX
+    def compensateAudio(self, packet={}, wantedSamples=0):
+        packet['samples'] = wantedSamples
+        packet['duration'] = wantedSamples / packet['rate']
 
-        if diff != None and abs(diff) < syncThreshold:
-            if diff > -syncThreshold:
-                # stream is ahead the external clock.
-                if diff > correctionThreshold:
-                    time.sleep(diff)
+        return packet
 
-                return self.PackageProcessingRelease
-            # stream is backward the external clock.
+    def synchronizeAudio(self, diff=0.0, packet={}):
+        wantedSamples = packet['samples']
+
+        if not math.isnan(diff) and abs(diff) < AV_NOSYNC_THRESHOLD:
+            self.audioDiffCum = diff + self.audioDiffAvgCoef * self.audioDiffCum
+
+            if self.audioDiffAvgCount < AUDIO_DIFF_AVG_NB:
+                # not enough measures to have a correct estimate
+                self.audioDiffAvgCount += 1
             else:
-                return self.PackageProcessingDiscard
+                # estimate the A-V difference
+                avgDiff = self.audioDiffCum * (1.0 - self.audioDiffAvgCoef)
+                audioDiffThreshold = 2.0 * self.outputAudioBufferSize / packet['rate']
 
-        return self.PackageProcessingReSync
+                if abs(avgDiff) >= audioDiffThreshold:
+                    samples = packet['samples']
+                    wantedSamples = samples + diff * packet['rate']
+                    minSamples = samples * (1.0 - SAMPLE_CORRECTION_PERCENT_MAX)
+                    maxSamples = samples * (1.0 + SAMPLE_CORRECTION_PERCENT_MAX)
+                    wantedSamples = int(max(minSamples, min(wantedSamples, maxSamples)))
+        else:
+            # too big difference: may be initial PTS errors, so
+            # reset A-V filter
+            self.audioDiffAvgCount = 0
+            self.audioDiffCum = 0
+
+        return wantedSamples
 
     def processAudioFrame(self):
         while True:
             packet = self.avqueue.dequeue('audio/x-raw')
+            pts = packet['pts']
 
             diff = self.audioClock.clock() - self.extrnClock.clock()
-            pts = packet['pts']
-            delay = packet['duration']
-
             self.audioClock.setClock(pts)
-            operation = self.synchronizeAudio(diff, delay)
 
-            if operation == self.PackageProcessingDiscard:
-                continue
-            elif operation == self.PackageProcessingReSync:
-                # update current video pts
-                self.extrnClock.syncTo(self.audioClock)
+            wantedSamples = self.synchronizeAudio(diff, packet)
+            packet = self.compensateAudio(packet, wantedSamples)
 
             self.printLog(packet, diff)
             self.output.releaseFrame(packet)
@@ -281,8 +289,7 @@ class Sync:
         # (resync)
 
         syncThreshold = max(AV_SYNC_THRESHOLD_MIN,
-                            min(delay,
-                                AV_SYNC_THRESHOLD_MAX))
+                            min(delay, AV_SYNC_THRESHOLD_MAX))
 
         if diff != None and abs(diff) < AV_NOSYNC_THRESHOLD:
             if diff > -syncThreshold:
@@ -326,4 +333,4 @@ if __name__== "__main__":
 
     while True:
 #        time.sleep(0.01)
-        sync.iStream(decoder.getPacket())
+        sync.iStream(decoder.readPacket())
