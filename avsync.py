@@ -26,10 +26,15 @@ import time
 import random
 import threading
 
+
 LOG = True
 PLAIN_LOG = True
 
-MAX_QUEUE_SIZE = 65536
+SAMPLE_RATE = 48000
+
+MAX_QUEUE_SIZE = 15 * 1024 * 1024
+
+# Output audio buffer in samples.
 OUTPUT_AUDIO_BUFFER_SIZE = 512
 
 # no AV sync correction is done if below the minimum AV sync threshold.
@@ -37,6 +42,9 @@ AV_SYNC_THRESHOLD_MIN = 0.01
 
 # AV sync correction is done if above the maximum AV sync threshold.
 AV_SYNC_THRESHOLD_MAX = 0.1
+
+# If a frame duration is longer than this, it will not be duplicated to compensate AV sync
+AV_SYNC_FRAMEDUP_THRESHOLD = 0.1
 
 # no AV correction is done if too big error.
 AV_NOSYNC_THRESHOLD = 5.0
@@ -47,247 +55,296 @@ SAMPLE_CORRECTION_PERCENT_MAX = 0.1
 # we use about AUDIO_DIFF_AVG_NB A-V differences to make the average.
 AUDIO_DIFF_AVG_NB = 20
 
+# Max number of samples.
+SAMPLE_ARRAY_SIZE = 8 * 65536
 
-class Decoder:
-    def __init__(self):
-        self.aPacket = {'mimeType': 'audio/x-raw',
-                        'rate': 48000,
-                        'samples': 1536}
+# Max number of video frames.
+MAX_VIDEO_QUEUE_SIZE = 3
 
-        self.vPacket = {'mimeType': 'video/x-raw',
-                        'fps': 30000 / 1001}
+class Stream:
+    def __init__(self, aPacket, vPacket):
+        self.aPacket = aPacket
+        self.vPacket = vPacket
 
         # Initialize AV frames.
         self.aN = 0
-        self.aDuration = self.aPacket['samples'] / self.aPacket['rate']
+
+        if self.aPacket == {}:
+            self.aDuration = 0
+            self.aRawSize = 0
+        else:
+            self.aDuration = aPacket['samples'] / aPacket['rate']
+            self.aRawSize = aPacket['bps'] * aPacket['channels'] * aPacket['samples']
 
         self.vN = 0
-        self.vDuration = 1 / self.vPacket['fps']
 
-    # Simulate frame capturing.
-    def readPacket(self):
-        aPts = self.aN * self.aDuration
-        vPts = self.vN * self.vDuration
-
-        # Get an audio frame.
-        if aPts <= vPts:
-            packet = {'pts': aPts, 'duration': self.aDuration}
-            packet.update(self.aPacket)
-            self.aN += 1
-
-            return packet
-        # Get an video frame.
+        if self.vPacket == {}:
+            self.vDuration = 0
+            self.vRawSize = 0
         else:
-            packet = {'pts': vPts, 'duration': self.vDuration}
-            packet.update(self.vPacket)
-            self.vN += 1
+            self.vDuration = 1 / vPacket['fps']
+            self.vRawSize = vPacket['width'] * vPacket['height'] * vPacket['bpp']
 
-            return packet
+        # Packet queue.
+        self.queueSize = 0
+        self.audioQueueSize = 0
+        self.videoQueueSize = 0
 
-class Output:
-    # Simulate frame processing.
-    def releaseFrame(self, frame={}):
-        jitter = 0.0 #random.uniform(0.0, 0.02)
-        time.sleep(frame['duration'] + jitter)
-
-class Clock:
-    def __init__(self):
-        self.setClock(float('nan'))
-
-    def clock(self):
-        return time.time() + self.ptsDrift
-
-    def setClockAt(self, pts=0, time=0):
-        self.pts = pts
-        self.ptsDrift = self.pts - time
-
-    def setClock(self, pts=0):
-        self.setClockAt(pts, time.time())
-
-    def syncTo(self, slave=None):
-        clock = self.clock()
-        slaveClock = slave.clock()
-
-        if not math.isnan(slaveClock) and \
-            (math.isnan(clock) or \
-            abs(clock - slaveClock) > AV_NOSYNC_THRESHOLD):
-            self.setClock(slaveClock)
-
-class AVQueue:
-    def __init__(self):
-        self.log = LOG
-        self.plainLog = PLAIN_LOG
-
-        self.maxSize = MAX_QUEUE_SIZE
-        self.audioQueue = []
-        self.videoQueue = []
-
-        self.fill = False
+        self.audioPacketQueue = []
+        self.videoPacketQueue = []
 
         self.queueMutex = threading.Lock()
-        self.iMutex = threading.Lock()
-        self.aoMutex = threading.Lock()
-        self.voMutex = threading.Lock()
+        self.audioMutex = threading.Lock()
+        self.videoMutex = threading.Lock()
+        self.queueNotFull = threading.Condition(self.queueMutex)
+        self.aQueueNotEmpty = threading.Condition(self.audioMutex)
+        self.vQueueNotEmpty = threading.Condition(self.videoMutex)
 
-        self.bufferNotFull = threading.Condition(self.iMutex)
-        self.audioBufferNotEmpty = threading.Condition(self.aoMutex)
-        self.videoBufferNotEmpty = threading.Condition(self.voMutex)
+    # Simulate packet capturing.
+    def readPackets(self):
+        while True:
+            aPts = self.aN * self.aDuration
+            vPts = self.vN * self.vDuration
 
-    def size(self, mimeType=''):
-        self.queueMutex.acquire()
+            # Simulate AV encoding.
+            encRatio = random.uniform(0.25, 0.75)
 
-        if mimeType == 'audio/x-raw':
-            size = len(self.audioQueue)
-        elif mimeType == 'video/x-raw':
-            size = len(self.videoQueue)
-        else:
-            size = len(self.audioQueue) + len(self.videoQueue)
+            self.queueMutex.acquire()
 
-        self.queueMutex.release()
+            if self.queueSize >= MAX_QUEUE_SIZE:
+                self.queueNotFull.wait()
 
-        return size
+            self.queueMutex.release()
 
-    def setMaxSize(self, maxSize=MAX_QUEUE_SIZE):
-        self.maxSize = maxSize
+            # Get an audio frame.
+            if (aPts <= vPts and self.aPacket != {}) or self.vPacket == {}:
+                    packet = {'pts': aPts,
+                              'duration': self.aDuration,
+                              'rawSize': self.aRawSize,
+                              'encRatio': encRatio,
+                              'compressedSize': encRatio * self.aRawSize}
+                    packet.update(self.aPacket)
+                    self.aN += 1
 
-    def dequeueAudio(self):
-        self.aoMutex.acquire()
-
-        if self.size('audio/x-raw') < 1:
-            self.audioBufferNotEmpty.wait()
-
-        self.queueMutex.acquire()
-        packet = self.audioQueue.pop(0)
-        self.queueMutex.release()
-
-        self.bufferNotFull.acquire()
-        self.bufferNotFull.notifyAll()
-        self.bufferNotFull.release()
-
-        self.aoMutex.release()
-
-        return packet
-
-    def dequeueVideo(self):
-        self.voMutex.acquire()
-
-        if self.size('video/x-raw') < 1:
-            self.videoBufferNotEmpty.wait()
-
-        self.queueMutex.acquire()
-        packet = self.videoQueue.pop(0)
-        self.queueMutex.release()
-
-        self.iMutex.acquire()
-        self.bufferNotFull.notifyAll()
-        self.iMutex.release()
-
-        self.voMutex.release()
-
-        return packet
-
-    def enqueue(self, packet={}):
-        bufferSize = self.size()
-
-        if bufferSize < 1:
-            self.fill = True
-
-        if bufferSize >= self.maxSize:
-            if self.fill:
-                if self.size('audio/x-raw') > 0:
-                    self.audioBufferNotEmpty.acquire()
-                    self.audioBufferNotEmpty.notifyAll()
-                    self.audioBufferNotEmpty.release()
-
-                if self.size('video/x-raw') > 0:
-                    self.videoBufferNotEmpty.acquire()
-                    self.videoBufferNotEmpty.notifyAll()
-                    self.videoBufferNotEmpty.release()
-
-                self.fill = False
-
-            self.iMutex.acquire()
-            self.bufferNotFull.wait()
-            self.iMutex.release()
-
-        self.queueMutex.acquire()
-
-        if packet['mimeType'] == 'audio/x-raw':
-            self.audioQueue.append(packet)
-        elif packet['mimeType'] == 'video/x-raw':
-            self.videoQueue.append(packet)
-
-        self.queueMutex.release()
-
-        if self.fill and self.log:
-            if self.plainLog:
-                print('filling buffer {0:3.1f}'.format(100 * self.size() / self.maxSize))
+                    self.audioMutex.acquire()
+                    self.audioPacketQueue.append(packet)
+                    self.audioQueueSize += packet['compressedSize']
+                    self.queueSize += packet["compressedSize"]
+                    self.aQueueNotEmpty.notifyAll()
+                    self.audioMutex.release()
+            # Get an video frame.
             else:
-                sys.stdout.write('\rfilling buffer {0:3.1f}'.format(100 * self.size() / self.maxSize))
+                if self.vPacket != {}:
+                    packet = {'pts': vPts,
+                              'duration': self.vDuration,
+                              'rawSize': self.vRawSize,
+                              'encRatio': encRatio,
+                              'compressedSize': encRatio * self.vRawSize}
+                    packet.update(self.vPacket)
+                    self.vN += 1
 
-        if not self.fill:
-            if self.size('audio/x-raw') > 0:
-                self.audioBufferNotEmpty.acquire()
-                self.audioBufferNotEmpty.notifyAll()
-                self.audioBufferNotEmpty.release()
+                    self.videoMutex.acquire()
+                    self.videoPacketQueue.append(packet)
+                    self.videoQueueSize += packet['compressedSize']
+                    self.queueSize += packet["compressedSize"]
+                    self.vQueueNotEmpty.notifyAll()
+                    self.videoMutex.release()
 
-            if self.size('video/x-raw') > 0:
-                self.videoBufferNotEmpty.acquire()
-                self.videoBufferNotEmpty.notifyAll()
-                self.videoBufferNotEmpty.release()
+    def readAudioPacket(self):
+        self.audioMutex.acquire()
 
-    def dequeue(self, mimeType=''):
-        if mimeType == 'audio/x-raw':
-            return self.dequeueAudio()
-        elif mimeType == 'video/x-raw':
-            return self.dequeueVideo()
+        if len(self.audioPacketQueue) < 1:
+            if not self.aQueueNotEmpty.wait(1):
+                self.audioMutex.release()
 
-        return {}
+                return {}
+
+        packet = self.audioPacketQueue.pop(0)
+        self.audioMutex.release()
+
+        self.audioQueueSize -= packet['compressedSize']
+        self.queueSize -= packet["compressedSize"]
+
+        self.queueMutex.acquire()
+
+        if self.queueSize < MAX_QUEUE_SIZE:
+            self.queueNotFull.notifyAll()
+
+        self.queueMutex.release()
+
+        return packet
+
+    def readVideoPacket(self):
+        self.videoMutex.acquire()
+
+        if len(self.videoPacketQueue) < 1:
+            if not self.vQueueNotEmpty.wait(1):
+                self.videoMutex.release()
+
+                return {}
+
+        packet = self.videoPacketQueue.pop(0)
+        self.videoMutex.release()
+
+        self.videoQueueSize -= packet['compressedSize']
+        self.queueSize -= packet["compressedSize"]
+
+        self.queueMutex.acquire()
+
+        if self.queueSize < MAX_QUEUE_SIZE:
+            self.queueNotFull.notifyAll()
+
+        self.queueMutex.release()
+
+        return packet
+
+    def start(self):
+        threading.Thread(target=self.readPackets, name='PacketRead').start()
+
+class Decoder:
+    def __init__(self, audioReadFunc, videoReadFunc):
+        self.audioReadFunc = audioReadFunc
+        self.videoReadFunc = videoReadFunc
+
+        # Frame queue.
+        self.audioSamples = 0
+        self.videoFrames = 0
+
+        self.audioFrameQueue = []
+        self.videoFrameQueue = []
+
+        self.audioMutex = threading.Lock()
+        self.videoMutex = threading.Lock()
+        self.audioQueueNotFull = threading.Condition(self.audioMutex)
+        self.videoQueueNotFull = threading.Condition(self.videoMutex)
+        self.aQueueNotEmpty = threading.Condition(self.audioMutex)
+        self.vQueueNotEmpty = threading.Condition(self.videoMutex)
+
+    def decodeAudio(self):
+        while True:
+            packet = self.audioReadFunc()
+
+            if packet == {}:
+                continue
+
+            # Simulate frame decoding
+            time.sleep(random.uniform(0.0, 0.5) * packet['duration'] * packet['encRatio'])
+
+            self.audioMutex.acquire()
+
+            if self.audioSamples >= SAMPLE_ARRAY_SIZE:
+                self.audioQueueNotFull.wait()
+
+            self.audioFrameQueue.append(packet)
+            self.audioSamples += packet['samples']
+            self.aQueueNotEmpty.notifyAll()
+            self.audioMutex.release()
+
+    def decodeVideo(self):
+        while True:
+            packet = self.videoReadFunc()
+
+            if packet == {}:
+                continue
+
+            # Simulate frame decoding
+            time.sleep(random.uniform(0.0, 0.5) * packet['duration'] * packet['encRatio'])
+
+            self.videoMutex.acquire()
+
+            if self.videoFrames >= MAX_VIDEO_QUEUE_SIZE:
+                self.videoQueueNotFull.wait()
+
+            self.videoFrameQueue.append(packet)
+            self.videoFrames += 1
+            self.vQueueNotEmpty.notifyAll()
+            self.videoMutex.release()
+
+    def readAudioFrame(self):
+        self.audioMutex.acquire()
+
+        if len(self.audioFrameQueue) < 1:
+            if not self.aQueueNotEmpty.wait(1):
+                self.audioMutex.release()
+
+                return {}
+
+        frame = self.audioFrameQueue.pop(0)
+        self.audioSamples -= frame["samples"]
+
+        if self.audioSamples < SAMPLE_ARRAY_SIZE:
+            self.audioQueueNotFull.notifyAll()
+
+        self.audioMutex.release()
+
+        return frame
+
+    def readVideoFrame(self):
+        self.videoMutex.acquire()
+
+        if len(self.videoFrameQueue) < 1:
+            if not self.vQueueNotEmpty.wait(1):
+                self.videoMutex.release()
+
+                return {}
+
+        frame = self.videoFrameQueue.pop(0)
+        self.videoFrames -= 1
+
+        if self.videoFrames < MAX_VIDEO_QUEUE_SIZE:
+            self.videoQueueNotFull.notifyAll()
+
+        self.videoMutex.release()
+
+        return frame
+
+    def start(self):
+        threading.Thread(target=self.decodeAudio, name='AudioDecoding').start()
+        threading.Thread(target=self.decodeVideo, name='VideoDecoding').start()
+
+class Output:
+    def __init__(self, sampleRate, syncObject):
+        self.sampleRate = sampleRate
+        self.audioCallbackFunc = syncObject.audioCallback
+        syncObject.drawFrame = self.drawFrame
+
+    # Simulate frame drawing in the screen.
+    def drawFrame(self, frame):
+        time.sleep(random.uniform(0.0, 0.25) * frame['duration'])
+
+    # Simulate audio consuming.
+    def audioLoop(self):
+        while True:
+            samplesRead = self.audioCallbackFunc(OUTPUT_AUDIO_BUFFER_SIZE)
+            time.sleep(0.1 * OUTPUT_AUDIO_BUFFER_SIZE / self.sampleRate)
+
+    def start(self):
+        threading.Thread(target=self.audioLoop, name='AudioThread').start()
 
 class Sync:
-    PackageProcessingRelease = 0
-    PackageProcessingDiscard = 1
-    PackageProcessingReSync = 2
+    def __init__(self, readAudioFunc, readVideoFunc):
+        self.readAudioFunc = readAudioFunc
+        self.readVideoFunc = readVideoFunc
 
-    def __init__(self):
-        self.log = LOG
-        self.plainLog = PLAIN_LOG
+        self.globalClock = 0
 
+        # Audio Parameters
+        self.audioTimeDrift = 0
         self.audioDiffAvgCoef = math.exp(math.log(0.01) / AUDIO_DIFF_AVG_NB)
         self.audioDiffCum = 0
         self.audioDiffAvgCount = 0
-        self.setOutputAudioBufferSize(OUTPUT_AUDIO_BUFFER_SIZE)
+        self.sampleBufferSize = 0
+        self.audioClock = 0
 
-        self.avqueue = AVQueue()
-        self.output = Output()
+        # Video Parameters
+        self.videoTimeDrift = 0
+        self.lastPts = 0
+        self.curFrame = {}
+        self.framesDropped = 0
 
-        self.audioClock = Clock()
-        self.videoClock = Clock()
-        self.extrnClock = Clock()
-
-        threading.Thread(target=self.processAudioFrame).start()
-        threading.Thread(target=self.processVideoFrame).start()
-
-    def printLog(self, packet, diff):
-        if self.log:
-            logFmt = '\r {} {:7.2f} A-V: {:7.3f} aq={:5d} vq={:5d}'
-
-            if self.plainLog:
-                logFmt += '\n'
-
-            log = logFmt.format(packet['mimeType'][0],
-                                self.extrnClock.clock(),
-                                -diff,
-                                self.avqueue.size('audio/x-raw'),
-                                self.avqueue.size('video/x-raw'))
-
-            sys.stdout.write(log)
-
-    def iStream(self, packet={}):
-        self.avqueue.enqueue(packet)
-
-    def setOutputAudioBufferSize(self, outputAudioBufferSize=OUTPUT_AUDIO_BUFFER_SIZE):
-        self.outputAudioBufferSize = outputAudioBufferSize
+    def setClock(self, clock):
+        self.globalClock = clock
+        self.videoTimeDrift = time.time() - clock
 
     def compensateAudio(self, packet={}, wantedSamples=0):
         packet['samples'] = wantedSamples
@@ -323,76 +380,140 @@ class Sync:
 
         return wantedSamples
 
-    def processAudioFrame(self):
-        while True:
-            packet = self.avqueue.dequeue('audio/x-raw')
+    def audioCallback(self, nSamples):
+        outSamples = 0
 
-            pts = packet['pts']
+        if self.sampleBufferSize < nSamples:
+            frame = self.readAudioFunc()
 
-            diff = self.audioClock.clock() - self.extrnClock.clock()
-            self.audioClock.setClock(pts)
-
-            wantedSamples = self.synchronizeAudio(diff, packet)
-            packet = self.compensateAudio(packet, wantedSamples)
-
-            self.printLog(packet, diff)
-            self.output.releaseFrame(packet)
-            self.extrnClock.syncTo(self.audioClock)
-
-    def synchronizeVideo(self, diff=0.0, delay=0.0):
-        # (resync)
-        # -AV_NOSYNC_THRESHOLD
-        # (discard)
-        # -syncThreshold
-        # (release)
-        # syncThreshold
-        # (wait)
-        # AV_NOSYNC_THRESHOLD
-        # (resync)
-
-        syncThreshold = max(AV_SYNC_THRESHOLD_MIN,
-                            min(delay, AV_SYNC_THRESHOLD_MAX))
-
-        if diff != None and abs(diff) < AV_NOSYNC_THRESHOLD:
-            if diff > -syncThreshold:
-                # stream is ahead the external clock.
-                if diff > syncThreshold:
-                    time.sleep(diff)
-
-                return self.PackageProcessingRelease
-            # stream is backward the external clock.
+            if frame == {}:
+                outSamples = min(self.sampleBufferSize, nSamples)
+                self.audioClock += outSamples / SAMPLE_RATE
+                self.sampleBufferSize = 0
             else:
-                return self.PackageProcessingDiscard
+                self.audioClock = frame['pts'] - self.sampleBufferSize / SAMPLE_RATE
+                self.sampleBufferSize += frame['samples']
+                outSamples = min(self.sampleBufferSize, nSamples)
+                self.sampleBufferSize -= outSamples
+        else:
+            self.sampleBufferSize -= nSamples
+            self.audioClock += nSamples / SAMPLE_RATE
+            outSamples = nSamples
 
-        # Update clocks.
+        self.globalClock = time.time() - self.audioTimeDrift
+        diff = self.audioClock - self.globalClock
+        #self.audioClock.setClock(pts)
 
-        return self.PackageProcessingReSync
+        #wantedSamples = self.synchronizeAudio(diff, packet)
+        #packet = self.compensateAudio(packet, wantedSamples)
+
+        self.logger.log('a', diff)
+        #self.output.releaseFrame(packet)
+        #self.extrnClock.syncTo(self.audioClock)
+
+        return outSamples
 
     def processVideoFrame(self):
         while True:
-            packet = self.avqueue.dequeue('video/x-raw')
+            if self.curFrame == {}:
+                self.curFrame = self.readVideoFunc()
 
-            diff = self.videoClock.clock() - self.extrnClock.clock()
-            pts = packet['pts']
-            delay = packet['duration']
-
-            self.videoClock.setClock(pts)
-            operation = self.synchronizeVideo(diff, delay)
-
-            if operation == self.PackageProcessingDiscard:
+            if self.curFrame == {}:
                 continue
-            elif operation == self.PackageProcessingReSync:
-                # update current video pts
-                self.extrnClock.syncTo(self.videoClock)
 
-            self.printLog(packet, diff)
-            self.output.releaseFrame(packet)
+            pts = self.curFrame['pts']
+            self.globalClock = time.time() - self.videoTimeDrift
+            diff = pts - self.globalClock
+            delay = pts - self.lastPts
+
+            # Skip or repeat frame. We take into account the
+            # delay to compute the threshold. I still don't know
+            # if it is the best guess
+            syncThreshold = max(AV_SYNC_THRESHOLD_MIN,
+                                min(delay, AV_SYNC_THRESHOLD_MAX))
+
+            if not math.isnan(diff) \
+               and abs(diff) < AV_NOSYNC_THRESHOLD \
+               and delay < AV_SYNC_FRAMEDUP_THRESHOLD:
+                if diff <= -syncThreshold:
+                    # video is backward the external clock.
+                    self.curFrame = {}
+                    self.lastPts = pts
+                    self.framesDropped += 1
+
+                    continue
+                elif diff > syncThreshold:
+                    # video is ahead the external clock.
+                    time.sleep(diff - syncThreshold)
+
+                    continue
+            else:
+                # Resync video.
+                self.globalClock = pts
+                self.videoTimeDrift = time.time() - pts
+
+            self.logger.log('v', diff)
+            self.drawFrame(self.curFrame)
+            self.curFrame = {}
+            self.lastPts = pts
+
+    def start(self):
+        threading.Thread(target=self.processVideoFrame, name='SyncVideo').start()
+
+class Logger:
+    def __init__(self, stream, sync):
+        self.stream = stream
+        self.sync = sync
+        self.sync.logger = self
+
+    def log(self, streamType, diff):
+        if LOG:
+            logFmt = '\r {} {:7.2f} A-V: {:7.3f} fd={:5d} aq={:5d} vq={:5d}'
+
+            if PLAIN_LOG:
+                logFmt += '\n'
+
+            log = logFmt.format(streamType,
+                                self.sync.globalClock,
+                                -diff,
+                                self.sync.framesDropped,
+                                int(self.stream.audioQueueSize),
+                                int(self.stream.videoQueueSize))
+
+            sys.stdout.write(log)
 
 
 if __name__== "__main__":
-    decoder = Decoder()
-    sync = Sync()
+    stream = Stream({'mimeType': 'audio/x-raw',
+                     'channels': 2,
+                     'bps': 2,
+                     'rate': SAMPLE_RATE,
+                     'samples': 1536},
+                    {})
+    #stream = Stream({},
+                    #{'mimeType': 'video/x-raw',
+                     #'width': 640,
+                     #'height': 480,
+                     #'bpp': 2,
+                     #'fps': 30000 / 1001})
+    #stream = Stream({'mimeType': 'audio/x-raw',
+                     #'channels': 2,
+                     #'bps': 2,
+                     #'rate': SAMPLE_RATE,
+                     #'samples': 1536},
+                    #{'mimeType': 'video/x-raw',
+                     #'width': 640,
+                     #'height': 480,
+                     #'bpp': 2,
+                     #'fps': 30000 / 1001})
+    decoder = Decoder(stream.readAudioPacket,
+                      stream.readVideoPacket)
+    sync = Sync(decoder.readAudioFrame,
+                decoder.readVideoFrame)
+    output = Output(SAMPLE_RATE, sync)
+    logger = Logger(stream, sync)
 
-    while True:
-#        time.sleep(0.02)
-        sync.iStream(decoder.readPacket())
+    stream.start()
+    decoder.start()
+    sync.start()
+    output.start()
