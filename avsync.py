@@ -35,7 +35,7 @@ SAMPLE_RATE = 48000
 MAX_QUEUE_SIZE = 15 * 1024 * 1024
 
 # Output audio buffer in samples.
-OUTPUT_AUDIO_BUFFER_SIZE = 512
+OUTPUT_AUDIO_BUFFER_SIZE = 1024
 
 # no AV sync correction is done if below the minimum AV sync threshold.
 AV_SYNC_THRESHOLD_MIN = 0.01
@@ -316,7 +316,7 @@ class Output:
     def audioLoop(self):
         while True:
             samplesRead = self.audioCallbackFunc(OUTPUT_AUDIO_BUFFER_SIZE)
-            time.sleep(0.1 * OUTPUT_AUDIO_BUFFER_SIZE / self.sampleRate)
+            time.sleep(0.9 * OUTPUT_AUDIO_BUFFER_SIZE / self.sampleRate)
 
     def start(self):
         threading.Thread(target=self.audioLoop, name='AudioThread').start()
@@ -348,12 +348,12 @@ class Sync:
 
     def compensateAudio(self, packet={}, wantedSamples=0):
         packet['samples'] = wantedSamples
-        packet['duration'] = wantedSamples / packet['rate']
+        packet['duration'] = wantedSamples / SAMPLE_RATE
 
         return packet
 
-    def synchronizeAudio(self, diff=0.0, packet={}):
-        wantedSamples = packet['samples']
+    def synchronizeAudio(self, diff=0.0, wantedSamples=0):
+        syncSamples = wantedSamples
 
         if not math.isnan(diff) and abs(diff) < AV_NOSYNC_THRESHOLD:
             self.audioDiffCum = diff + self.audioDiffAvgCoef * self.audioDiffCum
@@ -364,52 +364,46 @@ class Sync:
             else:
                 # estimate the A-V difference
                 avgDiff = self.audioDiffCum * (1.0 - self.audioDiffAvgCoef)
-                audioDiffThreshold = 2.0 * self.outputAudioBufferSize / packet['rate']
+                audioDiffThreshold = 2.0 * OUTPUT_AUDIO_BUFFER_SIZE / SAMPLE_RATE
 
                 if abs(avgDiff) >= audioDiffThreshold:
-                    samples = packet['samples']
-                    wantedSamples = samples + diff * packet['rate']
+                    samples = wantedSamples
+                    syncSamples = samples + diff * SAMPLE_RATE
                     minSamples = samples * (1.0 - SAMPLE_CORRECTION_PERCENT_MAX)
                     maxSamples = samples * (1.0 + SAMPLE_CORRECTION_PERCENT_MAX)
-                    wantedSamples = int(max(minSamples, min(wantedSamples, maxSamples)))
+                    syncSamples = int(max(minSamples, min(syncSamples, maxSamples)))
         else:
             # too big difference: may be initial PTS errors, so
             # reset A-V filter
             self.audioDiffAvgCount = 0
             self.audioDiffCum = 0
 
-        return wantedSamples
+        return syncSamples
 
     def audioCallback(self, nSamples):
-        outSamples = 0
-
         if self.sampleBufferSize < nSamples:
             frame = self.readAudioFunc()
 
-            if frame == {}:
-                outSamples = min(self.sampleBufferSize, nSamples)
-                self.audioClock += outSamples / SAMPLE_RATE
-                self.sampleBufferSize = 0
-            else:
+            if frame != {}:
                 self.audioClock = frame['pts'] - self.sampleBufferSize / SAMPLE_RATE
                 self.sampleBufferSize += frame['samples']
-                outSamples = min(self.sampleBufferSize, nSamples)
-                self.sampleBufferSize -= outSamples
-        else:
-            self.sampleBufferSize -= nSamples
-            self.audioClock += nSamples / SAMPLE_RATE
-            outSamples = nSamples
 
+        outSamples = min(self.sampleBufferSize, nSamples)
+
+        if outSamples < 1:
+            return 0
+
+        self.sampleBufferSize -= outSamples
         self.globalClock = time.time() - self.audioTimeDrift
         diff = self.audioClock - self.globalClock
-        #self.audioClock.setClock(pts)
 
-        #wantedSamples = self.synchronizeAudio(diff, packet)
+        wantedSamples = self.synchronizeAudio(diff, nSamples)
+        #print(wantedSamples)
         #packet = self.compensateAudio(packet, wantedSamples)
 
         self.logger.log('a', diff)
-        #self.output.releaseFrame(packet)
-        #self.extrnClock.syncTo(self.audioClock)
+        self.audioClock += outSamples / SAMPLE_RATE
+        self.audioTimeDrift = time.time() - self.audioClock
 
         return outSamples
 
