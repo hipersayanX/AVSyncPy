@@ -30,12 +30,7 @@ import threading
 LOG = True
 PLAIN_LOG = True
 
-SAMPLE_RATE = 48000
-
 MAX_QUEUE_SIZE = 15 * 1024 * 1024
-
-# Output audio buffer in samples.
-OUTPUT_AUDIO_BUFFER_SIZE = 1024
 
 # no AV sync correction is done if below the minimum AV sync threshold.
 AV_SYNC_THRESHOLD_MIN = 0.01
@@ -47,7 +42,7 @@ AV_SYNC_THRESHOLD_MAX = 0.1
 AV_SYNC_FRAMEDUP_THRESHOLD = 0.1
 
 # no AV correction is done if too big error.
-AV_NOSYNC_THRESHOLD = 5.0
+AV_NOSYNC_THRESHOLD = 10.0
 
 # maximum audio speed change to get correct sync.
 SAMPLE_CORRECTION_PERCENT_MAX = 0.1
@@ -56,7 +51,7 @@ SAMPLE_CORRECTION_PERCENT_MAX = 0.1
 AUDIO_DIFF_AVG_NB = 20
 
 # Max number of samples.
-SAMPLE_ARRAY_SIZE = 8 * 65536
+MAX_AUDIO_QUEUE_SIZE = 9
 
 # Max number of video frames.
 MAX_VIDEO_QUEUE_SIZE = 3
@@ -129,9 +124,12 @@ class Stream:
                     self.audioMutex.acquire()
                     self.audioPacketQueue.append(packet)
                     self.audioQueueSize += packet['compressedSize']
-                    self.queueSize += packet["compressedSize"]
                     self.aQueueNotEmpty.notifyAll()
                     self.audioMutex.release()
+
+                    self.queueMutex.acquire()
+                    self.queueSize += packet["compressedSize"]
+                    self.queueMutex.release()
             # Get an video frame.
             else:
                 if self.vPacket != {}:
@@ -146,9 +144,12 @@ class Stream:
                     self.videoMutex.acquire()
                     self.videoPacketQueue.append(packet)
                     self.videoQueueSize += packet['compressedSize']
-                    self.queueSize += packet["compressedSize"]
                     self.vQueueNotEmpty.notifyAll()
                     self.videoMutex.release()
+
+                    self.queueMutex.acquire()
+                    self.queueSize += packet["compressedSize"]
+                    self.queueMutex.release()
 
     def readAudioPacket(self):
         self.audioMutex.acquire()
@@ -160,12 +161,11 @@ class Stream:
                 return {}
 
         packet = self.audioPacketQueue.pop(0)
+        self.audioQueueSize -= packet['compressedSize']
         self.audioMutex.release()
 
-        self.audioQueueSize -= packet['compressedSize']
-        self.queueSize -= packet["compressedSize"]
-
         self.queueMutex.acquire()
+        self.queueSize -= packet["compressedSize"]
 
         if self.queueSize < MAX_QUEUE_SIZE:
             self.queueNotFull.notifyAll()
@@ -184,12 +184,11 @@ class Stream:
                 return {}
 
         packet = self.videoPacketQueue.pop(0)
+        self.videoQueueSize -= packet['compressedSize']
         self.videoMutex.release()
 
-        self.videoQueueSize -= packet['compressedSize']
-        self.queueSize -= packet["compressedSize"]
-
         self.queueMutex.acquire()
+        self.queueSize -= packet["compressedSize"]
 
         if self.queueSize < MAX_QUEUE_SIZE:
             self.queueNotFull.notifyAll()
@@ -232,11 +231,11 @@ class Decoder:
 
             self.audioMutex.acquire()
 
-            if self.audioSamples >= SAMPLE_ARRAY_SIZE:
+            if self.audioSamples >= MAX_AUDIO_QUEUE_SIZE:
                 self.audioQueueNotFull.wait()
 
             self.audioFrameQueue.append(packet)
-            self.audioSamples += packet['samples']
+            self.audioSamples += 1
             self.aQueueNotEmpty.notifyAll()
             self.audioMutex.release()
 
@@ -270,9 +269,9 @@ class Decoder:
                 return {}
 
         frame = self.audioFrameQueue.pop(0)
-        self.audioSamples -= frame["samples"]
+        self.audioSamples -= 1
 
-        if self.audioSamples < SAMPLE_ARRAY_SIZE:
+        if self.audioSamples < MAX_AUDIO_QUEUE_SIZE:
             self.audioQueueNotFull.notifyAll()
 
         self.audioMutex.release()
@@ -303,109 +302,95 @@ class Decoder:
         threading.Thread(target=self.decodeVideo, name='VideoDecoding').start()
 
 class Output:
-    def __init__(self, sampleRate, syncObject):
-        self.sampleRate = sampleRate
-        self.audioCallbackFunc = syncObject.audioCallback
+    def __init__(self, syncObject):
+        syncObject.playFrame = self.playFrame
         syncObject.drawFrame = self.drawFrame
+
+    # Simulate audio playback.
+    def playFrame(self, frame):
+        time.sleep(frame['samples'] / frame['rate'])
 
     # Simulate frame drawing in the screen.
     def drawFrame(self, frame):
         time.sleep(random.uniform(0.0, 0.25) * frame['duration'])
 
-    # Simulate audio consuming.
-    def audioLoop(self):
-        while True:
-            samplesRead = self.audioCallbackFunc(OUTPUT_AUDIO_BUFFER_SIZE)
-            time.sleep(0.9 * OUTPUT_AUDIO_BUFFER_SIZE / self.sampleRate)
+class Clock:
+    def __init__(self):
+        self.timeDrift = 0
+        self.mutex = threading.Lock()
 
-    def start(self):
-        threading.Thread(target=self.audioLoop, name='AudioThread').start()
+    def clock(self):
+        self.mutex.acquire();
+        clock = time.time() - self.timeDrift;
+        self.mutex.release();
+
+        return clock;
+
+    def setClock(self, clock):
+        self.mutex.acquire();
+        self.timeDrift = time.time() - clock;
+        self.mutex.release();
 
 class Sync:
     def __init__(self, readAudioFunc, readVideoFunc):
         self.readAudioFunc = readAudioFunc
         self.readVideoFunc = readVideoFunc
 
-        self.globalClock = 0
+        self.globalClock = Clock()
 
         # Audio Parameters
-        self.audioTimeDrift = 0
+        self.lastAudioPts = 0
         self.audioDiffAvgCoef = math.exp(math.log(0.01) / AUDIO_DIFF_AVG_NB)
         self.audioDiffCum = 0
         self.audioDiffAvgCount = 0
-        self.sampleBufferSize = 0
-        self.audioClock = 0
 
         # Video Parameters
-        self.videoTimeDrift = 0
-        self.lastPts = 0
+        self.lastVideoPts = 0
         self.curFrame = {}
         self.framesDropped = 0
 
-    def setClock(self, clock):
-        self.globalClock = clock
-        self.videoTimeDrift = time.time() - clock
-
-    def compensateAudio(self, packet={}, wantedSamples=0):
-        packet['samples'] = wantedSamples
-        packet['duration'] = wantedSamples / SAMPLE_RATE
-
-        return packet
-
-    def synchronizeAudio(self, diff=0.0, wantedSamples=0):
-        syncSamples = wantedSamples
-
-        if not math.isnan(diff) and abs(diff) < AV_NOSYNC_THRESHOLD:
-            self.audioDiffCum = diff + self.audioDiffAvgCoef * self.audioDiffCum
-
-            if self.audioDiffAvgCount < AUDIO_DIFF_AVG_NB:
-                # not enough measures to have a correct estimate
-                self.audioDiffAvgCount += 1
-            else:
-                # estimate the A-V difference
-                avgDiff = self.audioDiffCum * (1.0 - self.audioDiffAvgCoef)
-                audioDiffThreshold = 2.0 * OUTPUT_AUDIO_BUFFER_SIZE / SAMPLE_RATE
-
-                if abs(avgDiff) >= audioDiffThreshold:
-                    samples = wantedSamples
-                    syncSamples = samples + diff * SAMPLE_RATE
-                    minSamples = samples * (1.0 - SAMPLE_CORRECTION_PERCENT_MAX)
-                    maxSamples = samples * (1.0 + SAMPLE_CORRECTION_PERCENT_MAX)
-                    syncSamples = int(max(minSamples, min(syncSamples, maxSamples)))
-        else:
-            # too big difference: may be initial PTS errors, so
-            # reset A-V filter
-            self.audioDiffAvgCount = 0
-            self.audioDiffCum = 0
-
-        return syncSamples
-
-    def audioCallback(self, nSamples):
-        if self.sampleBufferSize < nSamples:
+    def processAudioFrame(self):
+        while True:
             frame = self.readAudioFunc()
 
-            if frame != {}:
-                self.audioClock = frame['pts'] - self.sampleBufferSize / SAMPLE_RATE
-                self.sampleBufferSize += frame['samples']
+            if frame == {}:
+                continue
 
-        outSamples = min(self.sampleBufferSize, nSamples)
+            pts = frame['pts']
+            diff = pts - self.globalClock.clock()
+            outputSamples = frame['samples']
 
-        if outSamples < 1:
-            return 0
+            if not math.isnan(diff) and abs(diff) < AV_NOSYNC_THRESHOLD:
+                self.audioDiffCum = diff + self.audioDiffAvgCoef * self.audioDiffCum
 
-        self.sampleBufferSize -= outSamples
-        self.globalClock = time.time() - self.audioTimeDrift
-        diff = self.audioClock - self.globalClock
+                if self.audioDiffAvgCount < AUDIO_DIFF_AVG_NB:
+                    # not enough measures to have a correct estimate
+                    self.audioDiffAvgCount += 1
+                else:
+                    # estimate the A-V difference
+                    avgDiff = self.audioDiffCum * (1.0 - self.audioDiffAvgCoef)
+                    audioDiffThreshold = frame['samples'] / frame['rate']
 
-        wantedSamples = self.synchronizeAudio(diff, nSamples)
-        #print(wantedSamples)
-        #packet = self.compensateAudio(packet, wantedSamples)
+                    if abs(avgDiff) >= audioDiffThreshold:
+                        outputSamples = frame['samples'] + diff * frame['rate']
+                        minSamples = frame['samples'] * (1.0 - SAMPLE_CORRECTION_PERCENT_MAX)
+                        maxSamples = frame['samples'] * (1.0 + SAMPLE_CORRECTION_PERCENT_MAX)
+                        outputSamples = int(max(minSamples, min(outputSamples, maxSamples)))
+            else:
+                # too big difference: may be initial PTS errors, so
+                # reset A-V filter
+                self.audioDiffAvgCount = 0
+                self.audioDiffCum = 0
 
-        self.logger.log('a', diff)
-        self.audioClock += outSamples / SAMPLE_RATE
-        self.audioTimeDrift = time.time() - self.audioClock
+            # Compensate audio.
+            frame['samples'] = outputSamples
 
-        return outSamples
+            if abs(diff) >= AV_NOSYNC_THRESHOLD:
+                self.globalClock.setClock(pts)
+
+            self.lastAudioPts = pts
+            self.logger.log()
+            self.playFrame(frame)
 
     def processVideoFrame(self):
         while True:
@@ -416,9 +401,8 @@ class Sync:
                 continue
 
             pts = self.curFrame['pts']
-            self.globalClock = time.time() - self.videoTimeDrift
-            diff = pts - self.globalClock
-            delay = pts - self.lastPts
+            diff = pts - self.globalClock.clock()
+            delay = pts - self.lastVideoPts
 
             # Skip or repeat frame. We take into account the
             # delay to compute the threshold. I still don't know
@@ -432,7 +416,7 @@ class Sync:
                 if diff <= -syncThreshold:
                     # video is backward the external clock.
                     self.curFrame = {}
-                    self.lastPts = pts
+                    self.lastVideoPts = pts
                     self.framesDropped += 1
 
                     continue
@@ -443,15 +427,15 @@ class Sync:
                     continue
             else:
                 # Resync video.
-                self.globalClock = pts
-                self.videoTimeDrift = time.time() - pts
+                self.globalClock.setClock(pts)
 
-            self.logger.log('v', diff)
+            self.lastVideoPts = pts
+            self.logger.log()
             self.drawFrame(self.curFrame)
             self.curFrame = {}
-            self.lastPts = pts
 
     def start(self):
+        threading.Thread(target=self.processAudioFrame, name='SyncAudio').start()
         threading.Thread(target=self.processVideoFrame, name='SyncVideo').start()
 
 class Logger:
@@ -460,54 +444,68 @@ class Logger:
         self.sync = sync
         self.sync.logger = self
 
-    def log(self, streamType, diff):
+    def log(self):
         if LOG:
-            logFmt = '\r {} {:7.2f} A-V: {:7.3f} fd={:5d} aq={:5d} vq={:5d}'
+            streamType = ''
+            diff = 0
+
+            if self.stream.aPacket != {} and self.stream.vPacket != {}:
+                streamType = 'A-V'
+                diff = self.sync.lastAudioPts - self.sync.lastVideoPts
+            elif self.stream.aPacket != {}:
+                streamType = 'M-A'
+                diff = self.sync.globalClock.clock() - self.sync.lastAudioPts
+            elif self.stream.vPacket != {}:
+                streamType = 'M-V'
+                diff = self.sync.globalClock.clock() - self.sync.lastVideoPts
+            else:
+                return
+
+            logFmt = '\r {:7.2f} {}: {:7.3f} fd={:5d} aq={:5d}KB vq={:5d}KB'
 
             if PLAIN_LOG:
                 logFmt += '\n'
 
-            log = logFmt.format(streamType,
-                                self.sync.globalClock,
-                                -diff,
+            log = logFmt.format(self.sync.globalClock.clock(),
+                                streamType,
+                                diff,
                                 self.sync.framesDropped,
-                                int(self.stream.audioQueueSize),
-                                int(self.stream.videoQueueSize))
+                                int(self.stream.audioQueueSize / 1024),
+                                int(self.stream.videoQueueSize / 1024))
 
             sys.stdout.write(log)
 
 
 if __name__== "__main__":
-    stream = Stream({'mimeType': 'audio/x-raw',
-                     'channels': 2,
-                     'bps': 2,
-                     'rate': SAMPLE_RATE,
-                     'samples': 1536},
-                    {})
+    #stream = Stream({'mimeType': 'audio/x-raw',
+                     #'channels': 2,
+                     #'bps': 2,
+                     #'rate': 48000,
+                     #'samples': 1536},
+                    #{})
     #stream = Stream({},
                     #{'mimeType': 'video/x-raw',
                      #'width': 640,
                      #'height': 480,
                      #'bpp': 2,
                      #'fps': 30000 / 1001})
-    #stream = Stream({'mimeType': 'audio/x-raw',
-                     #'channels': 2,
-                     #'bps': 2,
-                     #'rate': SAMPLE_RATE,
-                     #'samples': 1536},
-                    #{'mimeType': 'video/x-raw',
-                     #'width': 640,
-                     #'height': 480,
-                     #'bpp': 2,
-                     #'fps': 30000 / 1001})
+    stream = Stream({'mimeType': 'audio/x-raw',
+                     'channels': 2,
+                     'bps': 2,
+                     'rate': 48000,
+                     'samples': 1536},
+                    {'mimeType': 'video/x-raw',
+                     'width': 640,
+                     'height': 480,
+                     'bpp': 2,
+                     'fps': 30000 / 1001})
     decoder = Decoder(stream.readAudioPacket,
                       stream.readVideoPacket)
     sync = Sync(decoder.readAudioFrame,
                 decoder.readVideoFrame)
-    output = Output(SAMPLE_RATE, sync)
+    output = Output(sync)
     logger = Logger(stream, sync)
 
     stream.start()
     decoder.start()
     sync.start()
-    output.start()
