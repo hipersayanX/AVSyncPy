@@ -1,4 +1,4 @@
 AVSyncPy
 ========
 
-AVSync algorithm implemented in Python.
+Audio and Video synchronization algorithm implemented in Python.
