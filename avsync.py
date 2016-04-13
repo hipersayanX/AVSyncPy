@@ -30,6 +30,7 @@ import threading
 LOG = True
 PLAIN_LOG = True
 
+# Max package queue size in bytes.
 MAX_QUEUE_SIZE = 15 * 1024 * 1024
 
 # no AV sync correction is done if below the minimum AV sync threshold.
@@ -67,18 +68,22 @@ class Stream:
         if self.aPacket == {}:
             self.aDuration = 0
             self.aRawSize = 0
+            self.aCompressedSize = 0
         else:
             self.aDuration = aPacket['samples'] / aPacket['rate']
-            self.aRawSize = aPacket['bps'] * aPacket['channels'] * aPacket['samples']
+            self.aRawSize = aPacket['bps'] * aPacket['channels'] * aPacket['samples'] / 8
+            self.aCompressedSize = self.aDuration * aPacket['bitrate'] / 8
 
         self.vN = 0
 
         if self.vPacket == {}:
             self.vDuration = 0
             self.vRawSize = 0
+            self.vCompressedSize = 0
         else:
             self.vDuration = 1 / vPacket['fps']
-            self.vRawSize = vPacket['width'] * vPacket['height'] * vPacket['bpp']
+            self.vRawSize = vPacket['width'] * vPacket['height'] * vPacket['bpp'] / 8
+            self.vCompressedSize = self.vDuration * vPacket['bitrate'] / 8
 
         # Packet queue.
         self.queueSize = 0
@@ -101,9 +106,6 @@ class Stream:
             aPts = self.aN * self.aDuration
             vPts = self.vN * self.vDuration
 
-            # Simulate AV encoding.
-            encRatio = random.uniform(0.25, 0.75)
-
             self.queueMutex.acquire()
 
             if self.queueSize >= MAX_QUEUE_SIZE:
@@ -116,8 +118,7 @@ class Stream:
                     packet = {'pts': aPts,
                               'duration': self.aDuration,
                               'rawSize': self.aRawSize,
-                              'encRatio': encRatio,
-                              'compressedSize': encRatio * self.aRawSize}
+                              'compressedSize': self.aCompressedSize}
                     packet.update(self.aPacket)
                     self.aN += 1
 
@@ -136,8 +137,7 @@ class Stream:
                     packet = {'pts': vPts,
                               'duration': self.vDuration,
                               'rawSize': self.vRawSize,
-                              'encRatio': encRatio,
-                              'compressedSize': encRatio * self.vRawSize}
+                              'compressedSize': self.vCompressedSize}
                     packet.update(self.vPacket)
                     self.vN += 1
 
@@ -227,7 +227,7 @@ class Decoder:
                 continue
 
             # Simulate frame decoding
-            time.sleep(random.uniform(0.0, 0.5) * packet['duration'] * packet['encRatio'])
+            time.sleep(random.uniform(0.0, 0.25) * packet['duration'])
 
             self.audioMutex.acquire()
 
@@ -247,7 +247,7 @@ class Decoder:
                 continue
 
             # Simulate frame decoding
-            time.sleep(random.uniform(0.0, 0.5) * packet['duration'] * packet['encRatio'])
+            time.sleep(random.uniform(0.0, 0.25) * packet['duration'])
 
             self.videoMutex.acquire()
 
@@ -480,25 +480,29 @@ if __name__== "__main__":
     #stream = Stream({'mimeType': 'audio/x-raw',
                      #'channels': 2,
                      #'bps': 2,
-                     #'rate': 48000,
-                     #'samples': 1536},
+                     #'rate': 44100,
+                     #'samples': 1024,
+                     #'bitrate': 128000},
                     #{})
     #stream = Stream({},
                     #{'mimeType': 'video/x-raw',
                      #'width': 640,
                      #'height': 480,
-                     #'bpp': 2,
-                     #'fps': 30000 / 1001})
+                     #'bpp': 16,
+                     #'fps': 30000 / 1001,
+                     #'bitrate': 200000})
     stream = Stream({'mimeType': 'audio/x-raw',
                      'channels': 2,
-                     'bps': 2,
-                     'rate': 48000,
-                     'samples': 1536},
+                     'bps': 16,
+                     'rate': 44100,
+                     'samples': 1024,
+                     'bitrate': 128000},
                     {'mimeType': 'video/x-raw',
                      'width': 640,
                      'height': 480,
-                     'bpp': 2,
-                     'fps': 30000 / 1001})
+                     'bpp': 16,
+                     'fps': 30000 / 1001,
+                     'bitrate': 200000})
     decoder = Decoder(stream.readAudioPacket,
                       stream.readVideoPacket)
     sync = Sync(decoder.readAudioFrame,
