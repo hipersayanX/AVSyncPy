@@ -343,16 +343,16 @@ class Clock:
         self.mutex = threading.Lock()
 
     def clock(self):
-        self.mutex.acquire();
-        clock = time.time() - self.timeDrift;
-        self.mutex.release();
+        self.mutex.acquire()
+        clock = time.time() - self.timeDrift
+        self.mutex.release()
 
-        return clock;
+        return clock
 
     def setClock(self, clock):
-        self.mutex.acquire();
-        self.timeDrift = time.time() - clock;
-        self.mutex.release();
+        self.mutex.acquire()
+        self.timeDrift = time.time() - clock
+        self.mutex.release()
 
 class Sync:
     def __init__(self, readAudioFunc, readVideoFunc):
@@ -555,7 +555,7 @@ if __name__== "__main__":
     output = Output(sync)
     logger = Logger(stream, sync)
 
-    logger.streamLog();
+    logger.streamLog()
     stream.start()
     decoder.start()
     sync.start()
