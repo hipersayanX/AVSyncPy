@@ -364,7 +364,7 @@ class Sync:
         # Audio Parameters
         self.lastAudioPts = 0
         self.audioDiffAvgCoef = math.exp(math.log(0.01) / AUDIO_DIFF_AVG_NB)
-        self.audioDiffCum = 0
+        self.avgDiff = 0
         self.audioDiffAvgCount = 0
 
         # Video Parameters
@@ -385,17 +385,26 @@ class Sync:
             outputSamples = frame['samples']
 
             if not math.isnan(diff) and abs(diff) < AV_NOSYNC_THRESHOLD:
-                self.audioDiffCum = diff + self.audioDiffAvgCoef * self.audioDiffCum
+                # avgDiff is a weighted sum between previous average and current
+                # absolute diff.
+                # audioDiffAvgCoef must be in the range [0, 1], preferably it
+                # must be near to 0 when the number of samples to measure is
+                # very small, to give more importance to the average of all
+                # diferences,
+                # while it must be near to 1 when the number of samples to
+                # meassure is big enough to give morre importance to the last
+                # diff measured.
+                # So in this way the sample correction will be more stable.
+                self.avgDiff = self.avgDiff * (1.0 - self.audioDiffAvgCoef) + abs(diff) * self.audioDiffAvgCoef
 
                 if self.audioDiffAvgCount < AUDIO_DIFF_AVG_NB:
                     # not enough measures to have a correct estimate
                     self.audioDiffAvgCount += 1
                 else:
                     # estimate the A-V difference
-                    avgDiff = self.audioDiffCum * (1.0 - self.audioDiffAvgCoef)
-                    audioDiffThreshold = frame['samples'] / frame['rate']
+                    audioDiffThreshold = 2.0 * frame['samples'] / frame['rate']
 
-                    if abs(avgDiff) >= audioDiffThreshold:
+                    if abs(self.avgDiff) >= audioDiffThreshold:
                         outputSamples = frame['samples'] + diff * frame['rate']
                         minSamples = frame['samples'] * (1.0 - SAMPLE_CORRECTION_PERCENT_MAX / 100)
                         maxSamples = frame['samples'] * (1.0 + SAMPLE_CORRECTION_PERCENT_MAX / 100)
@@ -403,8 +412,8 @@ class Sync:
             else:
                 # too big difference: may be initial PTS errors, so
                 # reset A-V filter
+                self.avgDiff = 0
                 self.audioDiffAvgCount = 0
-                self.audioDiffCum = 0
 
             # Compensate audio.
             frame['samples'] = outputSamples
@@ -472,20 +481,22 @@ class Logger:
     def streamLog(self):
         print('Streams:')
 
-        vInfo = '    Video: {} bpp, {}x{}, {} kb/s, {:.2f} fps'
+        if self.stream.vPacket != {}:
+            vInfo = '    Video: {} bpp, {}x{}, {} kb/s, {:.2f} fps'
 
-        print(vInfo.format(self.stream.vPacket['bpp'],
-                           self.stream.vPacket['width'],
-                           self.stream.vPacket['height'],
-                           int(self.stream.vPacket['bitrate'] / 1000),
-                           self.stream.vPacket['fps']))
+            print(vInfo.format(self.stream.vPacket['bpp'],
+                            self.stream.vPacket['width'],
+                            self.stream.vPacket['height'],
+                            int(self.stream.vPacket['bitrate'] / 1000),
+                            self.stream.vPacket['fps']))
 
-        aInfo = '    Audio: {} Hz, {} ch, {} bps, {} kb/s'
+        if self.stream.aPacket != {}:
+            aInfo = '    Audio: {} Hz, {} ch, {} bps, {} kb/s'
 
-        print(aInfo.format(self.stream.aPacket['rate'],
-                           self.stream.aPacket['channels'],
-                           self.stream.aPacket['bps'],
-                           int(self.stream.aPacket['bitrate'] / 1000)))
+            print(aInfo.format(self.stream.aPacket['rate'],
+                            self.stream.aPacket['channels'],
+                            self.stream.aPacket['bps'],
+                            int(self.stream.aPacket['bitrate'] / 1000)))
 
         print()
 
